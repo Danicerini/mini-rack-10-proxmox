@@ -14,10 +14,12 @@ Armadio da 10 pollici stampato in 3D per **tre mini PC** (un cluster Proxmox), u
   - 1 vano da 2U in alto con switch, ESP32 e plancia inclinata.
 - **Frontali con display OLED** per ogni PC: nome, temperatura, CPU, RAM e da quanto è acceso. Il vetro del display arriva a filo del frontale.
 - **Plancia di controllo inclinata**:
-  - display TFT da 2,4" con 4 pagine sullo stato del cluster;
-  - barra a 10 LED con la CPU media del cluster;
-  - joystick per cambiare pagina;
+  - display TFT da 2,4" con 5 pagine (panoramica, nodi, macchine, backup e rete, impostazioni);
+  - barra a 10 LED con la CPU media del cluster (lampeggia tutta se il cluster perde il quorum);
+  - joystick a 4 direzioni: cambia pagina, apre nodi e macchine e, **tenendo premuto 1,5 s**, accende (Wake-on-LAN), riavvia o spegne i nodi e accende, riavvia, spegne o ferma VM e container;
+  - impostazioni dal joystick (luminosità, spegnimento schermi da 5 secondi a 30 minuti, scorrimento automatico) salvate nella memoria dell'ESP32: restano anche dopo un riavvio;
   - sensore di movimento PIR, che spegne i display quando non c'è nessuno.
+  - Il logo Proxmox non è incluso (è un marchio): senza il file `logo_proxmox.h` il firmware scrive "Proxmox" in testo. Puoi crearlo tu dal media kit ufficiale di Proxmox.
 - **Pannelli laterali traforati** a esagoni per l'aria, **maniglie** per trasportarlo e **piedini**.
 - Misure: **260 × 220 × 293 mm** circa.
 - Si stampa tutto su un piatto da **256 × 256 mm** (Bambu Lab A1, P1, X1).
@@ -141,9 +143,10 @@ Segui il manuale [`istruzioni/Manuale_montaggio_rack_10pollici.pdf`](istruzioni/
 4. **Caricare il firmware senza staccare niente**: se l'ESP32 è collegato al nodo, puoi caricarlo da lì con esptool.
    ```
    systemctl stop cluster-status
-   esptool --port /dev/ttyUSB0 --baud 460800 write-flash 0x0 cluster_completo.ino.merged.bin
+   esptool --port /dev/ttyUSB0 --baud 460800 write-flash 0x10000 cluster_completo.ino.bin
    systemctl start cluster-status
    ```
+   Carica solo `cluster_completo.ino.bin` a `0x10000`: così le impostazioni salvate restano. Il file `merged.bin` a `0x0` serve solo la prima volta (ESP32 nuovo), perché riscrive tutta la memoria e cancella le impostazioni.
 
 ### PCB (facoltativa)
 In `elettronica/pcb/` c'è una scheda da 70 × 47 mm che sostituisce basetta e fili. Ci sono due versioni:

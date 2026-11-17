@@ -1,8 +1,13 @@
 /*
- * Cluster Completo (v2) - plancia del rack: TFT 2.4" + 3 OLED (uno per PC) + PIR + barra 10 LED + joystick
+ * Cluster Completo (v3.1, 17/11/2026: impostazioni salvate da sole, spegnimento da 5 s) - plancia del rack: TFT 2.4" + 3 OLED (uno per PC) + PIR + barra 10 LED + joystick
  * Scheda: ESP32 DevKit (WROOM), collegato via USB a pve1. Dati: riga JSON ogni 5 s sulla seriale (115200)
- * dal servizio cluster-status di pve1, uguale alla v1.
- * La v1 (solo TFT) resta in display_esp32/cluster_display.ino.  Schema: display_esp32/v2_completo/Schema_collegamenti.pdf
+ * dal servizio cluster-status di pve1.
+ * v3: nuova grafica col logo Proxmox (provata nel simulatore display_esp32/simulatore_tft), 5 pagine,
+ *     joystick su 4 direzioni: destra/sinistra = pagina, su/giu' = scegli, clic = apri, tenere premuto = conferma.
+ *     Azioni sui nodi (Wake on LAN, riavvia, spegni): l'ESP manda "ACT <azione> <nodo>" sulla seriale,
+ *     cluster-status su pve1 le esegue e risponde "ACT_OK ..." oppure "ACT_ERR ...".
+ *     Impostazioni (luminosita', spegnimento schermi, scorrimento) salvate nella memoria dell'ESP.
+ * La v2 e' in v2_completo/cluster_completo_v2_backup_17-11.ino.txt
  *
  * PIN
  *  TFT ST7789 : CS 5, RESET 4, DC 16, MOSI 23, SCK 18, LED 25 (luminosita' PWM; -1 = LED fisso su 3V3)
@@ -17,6 +22,15 @@
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
+#include <Preferences.h>
+// Logo Proxmox (media kit ufficiale): file non incluso nella repo pubblica perche' e' un marchio.
+// Se manca, al suo posto viene scritto "Proxmox" in testo.
+#if __has_include("logo_proxmox.h")
+#include "logo_proxmox.h"
+#define HAS_LOGO 1
+#else
+#define HAS_LOGO 0
+#endif
 
 // ---------------- Configurazione ----------------
 #define PIN_TFT_BL    25      // -1 se il filo LED del TFT resta su 3V3
@@ -34,12 +48,13 @@ static const char* OLED_NODE[3] = { "pve1", "pve2", "pve3" };
 #define PIN_JOY_SW    33
 #define USE_JOY       1       // 0 se il joystick non e' collegato
 #define JOY_INVERT_X  0       // 1 se destra e sinistra sono al contrario
-#define SCREEN_OFF_MS (10UL * 1000UL)          // PROVA: 10 s. Normale: (5UL * 60UL * 1000UL) = 5 minuti
-#define BRIGHT_TFT    255     // 0..255
-#define BRIGHT_BAR    120     // 0..255
+#define JOY_INVERT_Y  0       // 1 se su e giu' sono al contrario
 #define BAR_REVERSED  0       // 1 se la barra si riempie dall'alto invece che dal basso
+#define HOLD_MS       1500    // quanto tenere premuto per confermare un'azione
 
-bool pageLocked = false;      // click del joystick: ferma lo scorrimento automatico
+// Impostazioni modificabili dal joystick (pagina Impostazioni), salvate in memoria
+struct Settings { int brightTft = 255; int brightBar = 120; int screenOffSec = 300; bool autoScroll = false; } set;
+Preferences prefs;
 
 // ---------------- Display ----------------
 class LGFX : public lgfx::LGFX_Device {
@@ -66,22 +81,29 @@ public:
 LGFX lcd;
 LGFX_Sprite cv(&lcd);
 
-// ---------------- Tema scuro ----------------
-static constexpr uint32_t C_BG    = 0x05070Du;
-static constexpr uint32_t C_CARD  = 0x0F1726u;
-static constexpr uint32_t C_CARD2 = 0x162034u;
-static constexpr uint32_t C_LINE  = 0x243049u;
-static constexpr uint32_t C_TEXT  = 0xF1F5F9u;
-static constexpr uint32_t C_DIM   = 0x7C8BA6u;
-static constexpr uint32_t C_ACC   = 0x22D3EEu;
+// ---------------- Colori (come nel simulatore) ----------------
+static constexpr uint32_t C_BG    = 0x07080Bu;
+static constexpr uint32_t C_CARD  = 0x121419u;
+static constexpr uint32_t C_CARD2 = 0x1A1D24u;
+static constexpr uint32_t C_LINE  = 0x272B35u;
+static constexpr uint32_t C_TEXT  = 0xF1F2F4u;
+static constexpr uint32_t C_DIM   = 0x7F8593u;
+static constexpr uint32_t C_ACC   = 0xE57000u;   // arancione Proxmox
 static constexpr uint32_t C_OK    = 0x34D399u;
 static constexpr uint32_t C_WARN  = 0xFBBF24u;
 static constexpr uint32_t C_BAD   = 0xF87171u;
 static constexpr uint32_t C_VIO   = 0xA78BFAu;
+static constexpr uint32_t C_CYAN  = 0x22D3EEu;
+
+// Font (LovyanGFX)
+#define F_TITLE (&fonts::FreeSansBold9pt7b)
+#define F_BIG   (&fonts::FreeSansBold12pt7b)
+#define F_BODY  (&fonts::Font2)
+#define F_SMALL (&fonts::Font0)
 
 // ---------------- Dati ----------------
-struct Node  { String name; bool online; int cpu; int cores; float mem; float memt; long up; int temp; int link; };
-struct Guest { int id; String name; bool ct; bool on; String node; };
+struct Node  { String name; String model; bool online; int cpu; int cores; float mem; float memt; long up; int temp; int link; };
+struct Guest { int id; String name; bool ct; bool on; String node; int cpu; float mem; };
 
 Node  nodes[4];   int nNodes = 0;
 Guest guests[24]; int nGuests = 0;
@@ -90,12 +112,27 @@ bool quorate = false;
 int onCount = 0, total = 0;
 bool hasBackup = false, bkOk = false; String bkWhen = ""; int bkFiles = 0;
 bool dataOk = false; unsigned long lastOkMs = 0; unsigned long packets = 0;
-
-const int PAGES = 4;
-const char* PAGE_NAMES[PAGES] = { "Panoramica", "Nodi", "Macchine", "Backup e rete" };
-int page = 0;
-unsigned long lastPageChange = 0, lastButton = 0;
 String rxLine;
+
+// ---------------- Stato dell'interfaccia ----------------
+const int PAGES = 5;
+const char* PAGE_NAMES[PAGES] = { "Panoramica", "Nodi", "Macchine", "Backup e rete", "Impostazioni" };
+enum View { V_PAGE, V_NODE, V_GUEST };
+View view = V_PAGE;
+int page = 0, sel = 0, scrollTop = 0, act = 0;
+bool editing = false;
+String selNode = ""; int selGuest = -1;
+unsigned long lastPageChange = 0, lastButton = 0;
+unsigned long pressStart = 0; bool holdFired = false;
+String toastMsg = ""; unsigned long toastUntil = 0;
+
+struct Action { const char* key; const char* label; bool needOn; uint32_t col; };
+const Action ACTIONS[3] = { { "wol", "Accendi (Wake on LAN)", false, C_OK }, { "reboot", "Riavvia", true, C_WARN }, { "shutdown", "Spegni", true, C_BAD } };
+// azioni sulle macchine (VM e container): l'ESP manda "GACT <azione> <id>"
+const Action GACTIONS[4] = { { "start", "Accendi", false, C_OK }, { "reboot", "Riavvia", true, C_WARN },
+                             { "shutdown", "Spegni (normale)", true, C_BAD }, { "stop", "Ferma subito (forzato)", true, C_BAD } };
+
+void toast(const String& m, unsigned long ms = 2200) { toastMsg = m; toastUntil = millis() + ms; }
 
 // ---------------- Seriale ----------------
 void parseStatus(const String& line) {
@@ -112,27 +149,23 @@ void parseStatus(const String& line) {
   for (JsonObject n : doc["nodes"].as<JsonArray>()) {
     if (nNodes >= 4) break;
     Node& d = nodes[nNodes++];
-    d.name = n["name"] | "?"; d.online = n["online"] | false;
+    d.name = n["name"] | "?"; d.model = n["model"] | ""; d.online = n["online"] | false;
     d.cpu = n["cpu"] | 0; d.cores = n["cores"] | 0;
     d.mem = n["mem"] | 0.0f; d.memt = n["memt"] | 0.0f; d.up = n["up"] | 0L;
     d.temp = n["temp"].isNull() ? -1 : n["temp"].as<int>();
     d.link = n["link"].isNull() ? 0 : n["link"].as<int>();
   }
   nGuests = 0;
-  // prima le accese, poi le spente
-  for (int pass = 0; pass < 2; pass++)
-    for (JsonObject g : doc["guests"].as<JsonArray>()) {
-      bool on = g["on"] | false;
-      if ((pass == 0) != on || nGuests >= 24) continue;
-      Guest& d = guests[nGuests++];
-      d.id = g["id"] | 0; d.name = g["name"] | "";
-      d.ct = String((const char*)(g["type"] | "vm")) == "ct";
-      d.on = on; d.node = g["node"] | "";
-    }
-  hasBackup = !doc["backup"].isNull();
-  if (hasBackup) {
-    bkWhen = doc["backup"]["when"] | ""; bkFiles = doc["backup"]["files"] | 0; bkOk = doc["backup"]["ok"] | false;
+  for (JsonObject g : doc["guests"].as<JsonArray>()) {     // in ordine di ID, come nel simulatore
+    if (nGuests >= 24) break;
+    Guest& d = guests[nGuests++];
+    d.id = g["id"] | 0; d.name = g["name"] | "";
+    d.ct = String((const char*)(g["type"] | "vm")) == "ct";
+    d.on = g["on"] | false; d.node = g["node"] | "";
+    d.cpu = g["cpu"] | 0; d.mem = g["mem"] | 0.0f;
   }
+  hasBackup = !doc["backup"].isNull();
+  if (hasBackup) { bkWhen = doc["backup"]["when"] | ""; bkFiles = doc["backup"]["files"] | 0; bkOk = doc["backup"]["ok"] | false; }
   dataOk = true; lastOkMs = millis(); packets++;
 }
 
@@ -142,12 +175,14 @@ void readSerial() {
     if (c == '\n') {
       rxLine.trim();
       if (rxLine.startsWith("{")) parseStatus(rxLine);
+      else if (rxLine.startsWith("ACT_OK")) toast("Fatto: " + rxLine.substring(7));
+      else if (rxLine.startsWith("ACT_ERR")) toast("Errore: " + rxLine.substring(8), 4000);
       rxLine = "";
     } else if (c != '\r' && rxLine.length() < 6000) rxLine += c;
   }
 }
 
-// ---------------- Disegno ----------------
+// ---------------- Aiuti di disegno ----------------
 uint32_t tempColor(int t) { if (t < 0) return C_DIM; if (t >= 80) return C_BAD; if (t >= 65) return C_WARN; return C_OK; }
 uint32_t pctColor(int p)  { if (p >= 85) return C_BAD; if (p >= 60) return C_WARN; return C_ACC; }
 bool fresh() { return dataOk && millis() - lastOkMs < 30000; }
@@ -164,265 +199,277 @@ String fmtWhen(const String& w) {   // "2026-11-10-1711" -> "10/11 17:11"
   return w.substring(8, 10) + "/" + w.substring(5, 7) + " " + w.substring(11, 13) + ":" + w.substring(13, 15);
 }
 
-void card(int x, int y, int w, int h) { cv.fillRoundRect(x, y, w, h, 10, C_CARD); }
-
-void bar(int x, int y, int w, int h, int pct, uint32_t col) {
-  pct = constrain(pct, 0, 100);
-  cv.fillRoundRect(x, y, w, h, h / 2, C_LINE);
-  int fw = (w * pct) / 100;
-  if (fw > 0) cv.fillRoundRect(x, y, max(fw, h), h, h / 2, col);
+void rr(int x, int y, int w, int h, int r, uint32_t c) { if (w <= 0 || h <= 0) return; cv.fillRoundRect(x, y, w, h, min(r, min(w, h) / 2), c); }
+void txt(const String& s, int x, int y, uint32_t col, const lgfx::IFont* f, textdatum_t d = textdatum_t::middle_left) {
+  cv.setFont(f); cv.setTextColor(col); cv.setTextDatum(d); cv.drawString(s, x, y);
 }
-
-// Indicatore circolare a 270 gradi
-void gauge(int cx, int cy, int r, int th, int pct, uint32_t col, const String& value, const char* label) {
+int tw(const String& s, const lgfx::IFont* f) { cv.setFont(f); return cv.textWidth(s); }
+void card(int x, int y, int w, int h, bool selected = false, uint32_t border = C_ACC) {
+  rr(x, y, w, h, 8, selected ? C_CARD2 : C_CARD);
+  if (selected) { cv.drawRoundRect(x, y, w, h, 8, border); cv.drawRoundRect(x + 1, y + 1, w - 2, h - 2, 7, border); }
+}
+void bar(int x, int y, int w, int h, int pct, uint32_t col) {
+  pct = constrain(pct, 0, 100); rr(x, y, w, h, h / 2, C_LINE);
+  int fw = (w * pct) / 100; if (fw > 0) rr(x, y, max(fw, h), h, h / 2, col);
+}
+// numero con il simbolo del grado disegnato (i font non hanno il carattere)
+void degTxt(int t, int x, int y, uint32_t col, const lgfx::IFont* f, bool right) {
+  String s = t < 0 ? String("-") : String(t);
+  int w = tw(s, f), x0 = right ? x - w - 6 : x - (w + 6) / 2;
+  txt(s, x0, y, col, f, textdatum_t::middle_left);
+  if (t >= 0) { int fh = cv.fontHeight(f); cv.drawCircle(x0 + w + 3, y - fh / 2 + 4, 2, col); cv.drawCircle(x0 + w + 3, y - fh / 2 + 4, 1, col); }
+}
+void gauge(int cx, int cy, int r, int th, int pct, uint32_t col, const String& value, const char* label, bool deg = false, int t = 0) {
   pct = constrain(pct, 0, 100);
   cv.fillArc(cx, cy, r, r - th, 135, 405, C_LINE);
   if (pct > 0) cv.fillArc(cx, cy, r, r - th, 135, 135 + 270 * pct / 100, col);
-  // valore centrato otticamente: posizionato sulla linea di base, simbolo del grado incluso nella larghezza
-  cv.setFont(&fonts::FreeSansBold9pt7b); cv.setTextColor(C_TEXT);
-  String v = value; bool deg = v.endsWith("C");
-  if (deg) v.remove(v.length() - 1);
-  int w = cv.textWidth(v), extra = deg ? 7 : 0;
-  int left = cx - (w + extra) / 2;
-  const int capH = 12;
-  cv.setTextDatum(textdatum_t::baseline_left);
-  cv.drawString(v, left, cy + capH / 2);
-  if (deg) cv.drawCircle(left + w + 4, cy - capH / 2 + 2, 2, C_TEXT);
-  cv.setFont(&fonts::Font0); cv.setTextColor(C_DIM); cv.setTextDatum(textdatum_t::middle_center);
-  cv.drawString(label, cx, cy + r - 4);
+  const lgfx::IFont* f = r > 30 ? F_BIG : F_TITLE;
+  if (deg) degTxt(t, cx, cy, C_TEXT, f, false); else txt(value, cx, cy, C_TEXT, f, textdatum_t::middle_center);
+  if (label) txt(label, cx, cy + r - 5, C_DIM, F_SMALL, textdatum_t::middle_center);
 }
-
-// Temperatura con simbolo del grado, allineata a destra in (xr, yc)
-void tempRight(int t, int xr, int yc) {
-  cv.setFont(&fonts::Font2); cv.setTextDatum(textdatum_t::middle_right); cv.setTextColor(tempColor(t));
-  if (t < 0) { cv.drawString("-", xr, yc); return; }
-  cv.drawString(String(t), xr - 6, yc);
-  cv.drawCircle(xr - 2, yc - 4, 2, tempColor(t));
+int pill(int x, int y, const String& s, uint32_t col) {
+  int w = tw(s, F_SMALL) + 12; rr(x, y, w, 15, 7, col);
+  txt(s, x + w / 2, y + 8, C_BG, F_SMALL, textdatum_t::middle_center); return w;
 }
+// triangolini per i suggerimenti (i font non hanno le frecce)
+void triL(int x, int y, uint32_t c) { cv.fillTriangle(x, y, x + 5, y - 4, x + 5, y + 4, c); }
+void triR(int x, int y, uint32_t c) { cv.fillTriangle(x + 5, y, x, y - 4, x, y + 4, c); }
+void triU(int x, int y, uint32_t c) { cv.fillTriangle(x, y + 3, x + 8, y + 3, x + 4, y - 3, c); }
+void triD(int x, int y, uint32_t c) { cv.fillTriangle(x, y - 3, x + 8, y - 3, x + 4, y + 3, c); }
 
-void pill(int x, int y, const String& txt, uint32_t col) {
-  cv.setFont(&fonts::Font2);
-  int w = cv.textWidth(txt) + 16;
-  cv.fillRoundRect(x, y, w, 20, 10, col);
-  cv.setTextColor(C_BG); cv.setTextDatum(textdatum_t::middle_center);
-  cv.drawString(txt, x + w / 2, y + 10);
-}
+Node* nodeByName(const String& n) { for (int i = 0; i < nNodes; i++) if (nodes[i].name == n) return &nodes[i]; return nullptr; }
+Guest* guestById(int id) { for (int i = 0; i < nGuests; i++) if (guests[i].id == id) return &guests[i]; return nullptr; }
+int onlineCount() { int c = 0; for (int i = 0; i < nNodes; i++) if (nodes[i].online) c++; return c; }
+int clusterCpu();
 
-void header() {
-  cv.setFont(&fonts::FreeSansBold9pt7b); cv.setTextColor(C_TEXT); cv.setTextDatum(textdatum_t::middle_left);
-  cv.drawString(PAGE_NAMES[page], 12, 16);
-  cv.setFont(&fonts::Font2);
+// ---------------- Testata e piede ----------------
+void header(const String& title, bool back) {
+  if (back) { triL(10, 15, C_ACC); txt(title, 22, 16, C_TEXT, F_TITLE); }
+  else {
+#if HAS_LOGO
+    cv.pushImage(10, 8, LOGO_HDR_W, LOGO_HDR_H, (const lgfx::rgb565_t*)LOGO_HDR);
+#else
+    txt("Proxmox", 10, 16, C_ACC, F_TITLE, textdatum_t::middle_left);
+#endif
+    txt(title, 124, 16, C_DIM, F_BODY); }
   bool f = fresh();
-  cv.setTextDatum(textdatum_t::middle_right);
-  cv.setTextColor(f ? C_DIM : C_BAD);
-  cv.drawString(f ? srvTime : String("offline"), 292, 16);
-  cv.fillCircle(304, 16, 4, f ? C_OK : C_BAD);
-  cv.drawFastHLine(12, 32, 296, C_LINE);
+  txt(f ? srvTime : String("offline"), 296, 16, f ? C_DIM : C_BAD, F_BODY, textdatum_t::middle_right);
+  cv.fillCircle(306, 16, 3, f ? C_OK : C_BAD);
+  cv.drawFastHLine(10, 31, 300, C_LINE);
 }
-
 void footer() {
-  for (int i = 0; i < PAGES; i++) {
-    int x = 160 - (PAGES - 1) * 9 + i * 18;
-    if (i == page) cv.fillRoundRect(x - 7, 229, 14, 5, 2, C_ACC); else cv.fillCircle(x, 231, 2, C_LINE);
-  }
-  if (pageLocked) {
-    cv.setFont(&fonts::Font0); cv.setTextColor(C_WARN); cv.setTextDatum(textdatum_t::middle_right);
-    cv.drawString("FERMA", 312, 231);
-  }
+  if (view == V_PAGE) for (int i = 0; i < PAGES; i++) { int x = 160 - (PAGES - 1) * 8 + i * 16; if (i == page) rr(x - 6, 229, 12, 4, 2, C_ACC); else cv.fillCircle(x, 231, 2, C_LINE); }
+  if (view == V_NODE) { triL(10, 231, C_DIM); txt("indietro", 18, 231, C_DIM, F_SMALL); triU(72, 231, C_DIM); triD(82, 231, C_DIM); txt("azione", 94, 231, C_DIM, F_SMALL); }
+  if (view == V_GUEST) { triL(10, 231, C_DIM); txt("indietro", 18, 231, C_DIM, F_SMALL); triU(72, 231, C_DIM); triD(82, 231, C_DIM); txt("azione", 94, 231, C_DIM, F_SMALL); }
+  if (set.autoScroll && view == V_PAGE) txt("AUTO", 310, 231, C_ACC, F_SMALL, textdatum_t::middle_right);
 }
 
+// ---------------- Pagine ----------------
 void pageOverview() {
-  // Macchine accese: anello grande
-  card(8, 40, 140, 132);
-  int pct = total > 0 ? 100 * onCount / total : 0;
-  gauge(78, 102, 50, 9, pct, C_ACC, String(onCount) + "/" + String(total), "MACCHINE ACCESE");
-  // Quorum
-  card(156, 40, 156, 62);
-  cv.setFont(&fonts::Font2); cv.setTextColor(C_DIM); cv.setTextDatum(textdatum_t::top_left);
-  cv.drawString("QUORUM", 168, 48);
-  pill(168, 72, quorate ? "OK" : "PERSO", quorate ? C_OK : C_BAD);
-  cv.setTextColor(C_DIM); cv.setTextDatum(textdatum_t::middle_left);
-  cv.drawString("voti " + votes + "/" + expectedVotes, 232, 82);
-  // Backup
-  card(156, 110, 156, 62);
-  cv.setTextColor(C_DIM); cv.setTextDatum(textdatum_t::top_left);
-  cv.drawString("BACKUP DB", 168, 118);
-  if (hasBackup) {
-    pill(168, 142, bkOk ? "OK" : "KO", bkOk ? C_OK : C_BAD);
-    cv.setTextColor(C_TEXT); cv.setTextDatum(textdatum_t::middle_left);
-    cv.drawString(fmtWhen(bkWhen), 214, 152);
-  } else {
-    pill(168, 142, "pve2 offline", C_WARN);
-  }
-  // Nodi (2 o 3 schede affiancate)
-  int y = 180, cnt = min(nNodes, 3);
-  int w = cnt > 0 ? (304 - (cnt - 1) * 8) / cnt : 304;
-  for (int i = 0; i < cnt; i++) {
-    Node& n = nodes[i];
-    int x = 8 + i * (w + 8);
-    card(x, y, w, 42);
-    cv.fillCircle(x + 12, y + 13, 4, n.online ? C_OK : C_BAD);
-    cv.setFont(&fonts::FreeSansBold9pt7b); cv.setTextColor(C_TEXT); cv.setTextDatum(textdatum_t::middle_left);
-    cv.drawString(n.name, x + 21, y + 13);
-    cv.setFont(&fonts::Font2); cv.setTextDatum(textdatum_t::middle_right);
-    if (n.online) {
-      tempRight(n.temp, x + w - 6, y + 13);
-      bar(x + 10, y + 28, w - 20, 6, n.cpu, pctColor(n.cpu));
-    } else {
-      cv.setTextColor(C_BAD); cv.drawString("off", x + w - 8, y + 13);
-      bar(x + 10, y + 28, w - 20, 6, 0, C_LINE);
-    }
+  int on = 0; for (int i = 0; i < nGuests; i++) if (guests[i].on) on++;
+  int tot = nGuests, avg = clusterCpu();
+  card(10, 40, 128, 120); gauge(74, 96, 46, 8, tot ? 100 * on / tot : 0, C_ACC, String(on) + "/" + String(tot), "MACCHINE ACCESE");
+  card(146, 40, 164, 56);
+  txt("CLUSTER", 156, 52, C_DIM, F_SMALL); pill(156, 66, quorate ? "QUORUM OK" : "QUORUM PERSO", quorate ? C_OK : C_BAD);
+  txt("voti " + votes + "/" + expectedVotes, 300, 74, C_DIM, F_BODY, textdatum_t::middle_right);
+  card(146, 104, 164, 56);
+  txt("CPU MEDIA", 156, 116, C_DIM, F_SMALL); txt(String(avg) + "%", 300, 116, C_TEXT, F_TITLE, textdatum_t::middle_right);
+  bar(156, 134, 144, 7, avg, pctColor(avg));
+  if (hasBackup) txt(String("backup ") + (bkOk ? "ok - " : "FALLITO - ") + fmtWhen(bkWhen), 156, 151, bkOk ? C_DIM : C_BAD, F_SMALL);
+  else txt("backup: pve2 non risponde", 156, 151, C_WARN, F_SMALL);
+  int n = min(nNodes, 3); if (n == 0) return;
+  int w = (300 - (n - 1) * 6) / n;
+  for (int i = 0; i < n; i++) {
+    Node& nd = nodes[i]; int x = 10 + i * (w + 6), y = 168;
+    card(x, y, w, 52);
+    cv.fillCircle(x + 10, y + 13, 3, nd.online ? C_OK : C_BAD); txt(nd.name, x + 18, y + 13, C_TEXT, F_TITLE);
+    if (nd.online) {
+      degTxt(nd.temp, x + w - 8, y + 13, tempColor(nd.temp), F_TITLE, true);
+      bar(x + 8, y + 30, w - 16, 5, nd.cpu, pctColor(nd.cpu));
+      txt("cpu " + String(nd.cpu) + "%", x + 8, y + 43, C_DIM, F_SMALL); txt(fmtUp(nd.up), x + w - 8, y + 43, C_DIM, F_SMALL, textdatum_t::middle_right);
+    } else { txt("spento", x + w - 8, y + 13, C_BAD, F_BODY, textdatum_t::middle_right); bar(x + 8, y + 30, w - 16, 5, 0, C_LINE); }
   }
 }
 
 void pageNodes() {
-  int cnt = min(nNodes, 3);
-  bool compact = cnt >= 3;
-  int h = compact ? 58 : 88, gap = 6, y = 40;
-  for (int i = 0; i < cnt; i++) {
-    Node& n = nodes[i];
-    card(8, y, 304, h);
-    if (!compact) {
-      cv.fillCircle(22, y + 14, 4, n.online ? C_OK : C_BAD);
-      cv.setFont(&fonts::FreeSansBold9pt7b); cv.setTextColor(C_TEXT); cv.setTextDatum(textdatum_t::middle_left);
-      cv.drawString(n.name, 32, y + 14);
-      cv.setFont(&fonts::Font2); cv.setTextColor(C_DIM); cv.setTextDatum(textdatum_t::middle_right);
-      cv.drawString(n.online ? ("acceso da " + fmtUp(n.up)) : String("spento"), 302, y + 14);
+  int n = min(nNodes, 3), h = n >= 3 ? 58 : 86;
+  for (int i = 0; i < n; i++) {
+    Node& nd = nodes[i]; int y = 40 + i * (h + 6);
+    card(10, y, 300, h, sel == i);
+    cv.fillCircle(22, y + 14, 3, nd.online ? C_OK : C_BAD); txt(nd.name, 30, y + 14, C_TEXT, F_TITLE);
+    txt(nd.model, 30 + tw(nd.name, F_TITLE) + 8, y + 14, C_DIM, F_SMALL);
+    if (!nd.online) { txt("spento - clic per accenderlo", 300, y + 14, C_BAD, F_BODY, textdatum_t::middle_right); continue; }
+    txt("acceso da " + fmtUp(nd.up), 300, y + 14, C_DIM, F_SMALL, textdatum_t::middle_right);
+    int by = y + h - 30, mp = nd.memt > 0 ? (int)(100 * nd.mem / nd.memt) : 0;
+    struct { const char* l; String v; int p; uint32_t c; } cols[3] = {
+      { "CPU", String(nd.cpu) + "%", nd.cpu, pctColor(nd.cpu) },
+      { "RAM", String(nd.mem, 1) + "/" + String((int)(nd.memt + 0.5)) + "G", mp, pctColor(mp) },
+      { "TEMP", "", min(100, max(0, nd.temp)), tempColor(nd.temp) } };
+    for (int k = 0; k < 3; k++) {
+      int x = 22 + k * 96;
+      txt(cols[k].l, x, by, C_DIM, F_SMALL);
+      if (k == 2) degTxt(nd.temp, x + 84, by, C_TEXT, F_BODY, true); else txt(cols[k].v, x + 84, by, C_TEXT, F_BODY, textdatum_t::middle_right);
+      bar(x, by + 9, 84, 5, cols[k].p, cols[k].c);
     }
-    if (n.online) {
-      int r = compact ? 22 : 28, th = compact ? 5 : 6;
-      int gy = compact ? y + 30 : y + 56;
-      int g1 = compact ? 112 : 52, g2 = compact ? 166 : 122;
-      if (compact) {
-        cv.fillCircle(20, y + 15, 4, C_OK);
-        cv.setFont(&fonts::FreeSansBold9pt7b); cv.setTextColor(C_TEXT); cv.setTextDatum(textdatum_t::middle_left);
-        cv.drawString(n.name, 30, y + 15);
-        cv.setFont(&fonts::Font0); cv.setTextColor(C_DIM);
-        cv.drawString(fmtUp(n.up), 30, y + 36);
-      }
-      gauge(g1, gy, r, th, n.cpu, pctColor(n.cpu), String(n.cpu) + "%", "CPU");
-      gauge(g2, gy, r, th, n.temp < 0 ? 0 : n.temp, tempColor(n.temp), n.temp >= 0 ? String(n.temp) + "C" : String("-"), "TEMP");
-      int mp = n.memt > 0 ? (int)(100 * n.mem / n.memt) : 0;
-      int rx = compact ? 200 : 168, rw = 300 - rx, ry = compact ? y + 10 : y + 34;
-      cv.setFont(&fonts::Font2); cv.setTextDatum(textdatum_t::top_left);
-      cv.setTextColor(C_DIM); cv.drawString("RAM", rx, ry);
-      cv.setTextColor(C_TEXT); cv.setTextDatum(textdatum_t::top_right);
-      cv.drawString(String(n.mem, 1) + "/" + String((int)(n.memt + 0.5)) + "G", 300, ry);
-      bar(rx, ry + 20, rw, 8, mp, pctColor(mp));
-      if (!compact) {
-        cv.setTextDatum(textdatum_t::top_left); cv.setTextColor(C_DIM);
-        cv.drawString(String(n.cores) + " core  " + (n.link > 0 ? String(n.link) + " Mb/s" : String("")), rx, ry + 34);
-      }
-    } else if (compact) {
-      cv.fillCircle(20, y + 15, 4, C_BAD);
-      cv.setFont(&fonts::FreeSansBold9pt7b); cv.setTextColor(C_TEXT); cv.setTextDatum(textdatum_t::middle_left);
-      cv.drawString(n.name, 30, y + 15);
-      cv.setFont(&fonts::Font2); cv.setTextColor(C_BAD); cv.drawString("spento / non raggiungibile", 110, y + 29);
-    }
-    y += h + gap;
   }
-}
-
-void guestRow(Guest& g, int x, int y) {
-  cv.fillRoundRect(x, y, 148, 20, 6, g.on ? C_CARD2 : C_CARD);
-  cv.fillCircle(x + 10, y + 10, 3, g.on ? C_OK : C_LINE);
-  cv.setTextDatum(textdatum_t::middle_left);
-  cv.setTextColor(g.ct ? C_ACC : C_VIO);
-  cv.drawString(String(g.id), x + 20, y + 10);
-  cv.setTextColor(g.on ? C_TEXT : C_DIM);
-  String nm = g.name; if (nm.length() > 12) nm = nm.substring(0, 12);
-  cv.drawString(nm, x + 52, y + 10);
 }
 
 void pageGuests() {
-  int nOn = 0, nOff = 0;
-  for (int i = 0; i < nGuests; i++) (guests[i].on ? nOn : nOff)++;
-  cv.setFont(&fonts::Font2); cv.setTextDatum(textdatum_t::middle_left);
-  cv.setTextColor(C_OK);  cv.drawString("ACCESE  " + String(nOn), 12, 46);
-  cv.setTextColor(C_DIM); cv.drawString("SPENTE  " + String(nOff), 166, 46);
-  int yOn = 58, yOff = 58;
-  for (int i = 0; i < nGuests; i++) {
-    Guest& g = guests[i];
-    if (g.on)  { if (yOn  <= 202) { guestRow(g, 8, yOn);    yOn  += 23; } }
-    else       { if (yOff <= 202) { guestRow(g, 164, yOff); yOff += 23; } }
+  const int vis = 8, rh = 21;
+  if (sel < scrollTop) scrollTop = sel;
+  if (sel >= scrollTop + vis) scrollTop = sel - vis + 1;
+  int nOn = 0; for (int i = 0; i < nGuests; i++) if (guests[i].on) nOn++;
+  txt(String(nOn) + " accese - " + String(nGuests - nOn) + " spente", 10, 42, C_DIM, F_SMALL);
+  txt("CT", 282, 42, C_CYAN, F_SMALL, textdatum_t::middle_right); txt("VM", 306, 42, C_VIO, F_SMALL, textdatum_t::middle_right);
+  for (int i = 0; i < vis && scrollTop + i < nGuests; i++) {
+    Guest& g = guests[scrollTop + i]; int y = 50 + i * rh; bool s = scrollTop + i == sel;
+    rr(10, y, 292, rh - 3, 5, s ? C_CARD2 : (g.on ? C_CARD : C_BG)); if (s) rr(10, y, 3, rh - 3, 1, C_ACC);
+    cv.fillCircle(22, y + 9, 3, g.on ? C_OK : C_LINE);
+    txt(String(g.id), 30, y + 9, g.ct ? C_CYAN : C_VIO, F_BODY);
+    String nm = g.name; if (nm.length() > 16) nm = nm.substring(0, 16);
+    txt(nm, 60, y + 9, g.on ? C_TEXT : C_DIM, F_BODY); txt(g.node, 200, y + 9, C_DIM, F_SMALL);
+    txt(g.on ? String(g.cpu) + "%  " + String(g.mem, 1) + "G" : String("spenta"), 296, y + 9, g.on ? C_DIM : C_LINE, F_BODY, textdatum_t::middle_right);
   }
-  cv.setFont(&fonts::Font0); cv.setTextDatum(textdatum_t::middle_right);
-  cv.setTextColor(C_ACC); cv.drawString("CT", 292, 46);
-  cv.setTextColor(C_VIO); cv.drawString("VM", 310, 46);
+  if (nGuests > 0) { int th = 168 * min(vis, nGuests) / nGuests, ty = 50 + 168 * scrollTop / nGuests; rr(306, 50, 3, 168, 1, C_CARD); rr(306, ty, 3, th, 1, C_DIM); }
 }
 
 void pageBackupNet() {
-  // --- Backup: scheda in alto ---
-  card(8, 40, 304, 82);
+  card(10, 40, 300, 80);
   uint32_t bc = !hasBackup ? C_WARN : (bkOk ? C_OK : C_BAD);
-  cv.fillArc(42, 81, 22, 17, 0, 360, bc);
-  cv.setFont(&fonts::FreeSansBold9pt7b); cv.setTextColor(bc); cv.setTextDatum(textdatum_t::middle_center);
-  cv.drawString(!hasBackup ? "?" : (bkOk ? "OK" : "!"), 42, 81);
-  cv.setTextDatum(textdatum_t::top_left);
-  cv.setFont(&fonts::Font2); cv.setTextColor(C_DIM);
-  cv.drawString("ULTIMO BACKUP DATABASE", 80, 50);
-  cv.setFont(&fonts::FreeSansBold12pt7b); cv.setTextColor(C_TEXT);
-  cv.drawString(hasBackup ? fmtWhen(bkWhen) : String("--"), 80, 68);
-  cv.setFont(&fonts::Font2); cv.setTextColor(C_DIM);
-  cv.drawString(hasBackup ? (String(bkFiles) + " database  -  prossimo alle 03:30") : String("pve2 non raggiungibile"), 80, 98);
-
-  // --- Rete: tabella allineata ---
-  card(8, 130, 304, 92);
-  cv.setFont(&fonts::Font2); cv.setTextDatum(textdatum_t::top_left); cv.setTextColor(C_DIM);
-  cv.drawString("RETE", 20, 138);
-  int cnt = min(nNodes, 3);
-  for (int i = 0; i < cnt + 1; i++) {
-    int y = 158 + i * 19;
-    if (i < cnt) {
-      Node& n = nodes[i];
-      cv.fillCircle(24, y + 7, 3, n.online ? C_OK : C_BAD);
-      cv.setTextColor(C_TEXT); cv.drawString(n.name, 34, y);
-      cv.setTextDatum(textdatum_t::top_right);
-      uint32_t c = !n.online ? C_BAD : (n.link >= 1000 ? C_OK : C_WARN);
-      cv.setTextColor(c);
-      cv.drawString(!n.online ? String("offline") : (n.link > 0 ? String(n.link) + " Mb/s" : String("?")), 300, y);
-      cv.setTextDatum(textdatum_t::top_left);
-    } else {
-      cv.fillCircle(24, y + 7, 3, fresh() ? C_OK : C_BAD);
-      cv.setTextColor(C_TEXT); cv.drawString("display", 34, y);
-      cv.setTextDatum(textdatum_t::top_right); cv.setTextColor(C_DIM);
-      cv.drawString("USB  " + String(packets) + " agg.", 300, y);
-      cv.setTextDatum(textdatum_t::top_left);
-    }
+  cv.fillArc(44, 80, 20, 16, 0, 360, bc);
+  txt(!hasBackup ? "?" : (bkOk ? "OK" : "!"), 44, 81, bc, F_TITLE, textdatum_t::middle_center);
+  txt("ULTIMO BACKUP DATABASE", 76, 54, C_DIM, F_SMALL);
+  txt(hasBackup ? fmtWhen(bkWhen) : String("--"), 76, 75, C_TEXT, F_BIG);
+  txt(!hasBackup ? String("pve2 non raggiungibile") : (bkOk ? String(bkFiles) + " database - prossimo alle 03:30" : String("copia incompleta: controlla pve2")), 76, 100, bkOk ? C_DIM : C_BAD, F_BODY);
+  card(10, 128, 300, 92); txt("RETE", 22, 140, C_DIM, F_SMALL);
+  int n = min(nNodes, 3);
+  for (int i = 0; i <= n; i++) {
+    int y = 158 + i * 17; String a, b; uint32_t c;
+    if (i < n) { Node& nd = nodes[i]; a = nd.name; b = !nd.online ? String("offline") : (nd.link >= 1000 ? String("1 Gb/s") : (nd.link > 0 ? String(nd.link) + " Mb/s" : String("?")));
+                 c = !nd.online ? C_BAD : (nd.link >= 1000 ? C_OK : C_WARN); }
+    else { a = "display"; b = fresh() ? "USB ok - " + String(packets) + " agg." : String("nessun dato"); c = fresh() ? C_OK : C_BAD; }
+    cv.fillCircle(24, y, 3, c); txt(a, 34, y, C_TEXT, F_BODY); txt(b, 298, y, c, F_BODY, textdatum_t::middle_right);
   }
 }
 
-void render() {
-  cv.fillScreen(C_BG);
-  header();
-  if (nNodes == 0) {
-    cv.setTextDatum(textdatum_t::middle_center);
-    cv.setFont(&fonts::FreeSansBold9pt7b); cv.setTextColor(C_TEXT);
-    cv.drawString("In attesa dei dati...", 160, 110);
-    cv.setFont(&fonts::Font2); cv.setTextColor(C_DIM);
-    cv.drawString("collegami alla USB di pve1", 160, 136);
+struct SettingDef { const char* label; };
+const SettingDef SETTINGS[4] = { { "Luminosita' TFT" }, { "Luminosita' barra LED" }, { "Spegni schermi dopo" }, { "Scorrimento automatico" } };
+String settingValue(int i) {
+  switch (i) {
+    case 0: return String((set.brightTft * 100 + 127) / 255) + "%";
+    case 1: return String((set.brightBar * 100 + 127) / 255) + "%";
+    case 2: return set.screenOffSec < 60 ? String(set.screenOffSec) + " s" : String(set.screenOffSec / 60) + " min";
+    default: return set.autoScroll ? "si'" : "no";
+  }
+}
+void pageSettings() {
+  for (int i = 0; i < 4; i++) {
+    int y = 40 + i * 40; bool s = sel == i;
+    card(10, y, 300, 34, s);
+    txt(SETTINGS[i].label, 22, y + 17, C_TEXT, F_BODY);
+    if (s && editing) { triL(205, y + 17, C_ACC); txt(settingValue(i), 252, y + 17, C_ACC, F_TITLE, textdatum_t::middle_center); triR(290, y + 17, C_ACC); }
+    else txt(settingValue(i), 298, y + 17, s ? C_TEXT : C_DIM, F_TITLE, textdatum_t::middle_right);
+  }
+  txt("firmware v3 - ESP32 - dati da pve1 via USB", 160, 214, C_DIM, F_SMALL, textdatum_t::middle_center);
+}
+
+int nodeActions(Node* nd, const Action* out[3]) {
+  int n = 0; for (int i = 0; i < 3; i++) if (ACTIONS[i].needOn == (nd && nd->online)) out[n++] = &ACTIONS[i];
+  return n;
+}
+int guestActions(Guest* g, const Action* out[4]) {
+  int n = 0; for (int i = 0; i < 4; i++) if (GACTIONS[i].needOn == (g && g->on)) out[n++] = &GACTIONS[i];
+  return n;
+}
+void nodeDetail() {
+  Node* nd = nodeByName(selNode);
+  if (!nd) { view = V_PAGE; return; }
+  header(nd->name + (nd->model.length() ? " - " + nd->model : String("")), true);
+  if (nd->online) {
+    gauge(52, 80, 34, 6, nd->cpu, pctColor(nd->cpu), String(nd->cpu) + "%", "CPU");
+    gauge(130, 80, 34, 6, min(100, max(0, nd->temp)), tempColor(nd->temp), "", "TEMP", true, nd->temp);
+    int mp = nd->memt > 0 ? (int)(100 * nd->mem / nd->memt) : 0;
+    txt("RAM", 180, 52, C_DIM, F_SMALL); txt(String(nd->mem, 1) + " / " + String((int)(nd->memt + 0.5)) + " GB", 308, 52, C_TEXT, F_BODY, textdatum_t::middle_right);
+    bar(180, 62, 128, 6, mp, pctColor(mp));
+    txt(String(nd->cores) + " thread - " + (nd->link >= 1000 ? String("1 Gb/s") : String(nd->link) + " Mb/s"), 180, 82, C_DIM, F_SMALL);
+    txt("acceso da " + fmtUp(nd->up), 180, 96, C_DIM, F_SMALL);
+    String ids = ""; int c = 0;
+    for (int i = 0; i < nGuests; i++) if (guests[i].on && guests[i].node == nd->name) { ids += " " + String(guests[i].id); c++; }
+    txt(c ? String(c) + " macchine accese:" + ids : String("nessuna macchina accesa"), 10, 128, C_DIM, F_SMALL);
   } else {
-    switch (page) {
+    txt("Il nodo e' spento o non risponde.", 160, 80, C_BAD, F_TITLE, textdatum_t::middle_center);
+    txt("Puoi accenderlo con Wake on LAN.", 160, 100, C_DIM, F_BODY, textdatum_t::middle_center);
+  }
+  const Action* acts[3]; int n = nodeActions(nd, acts); if (act >= n) act = 0;
+  for (int i = 0; i < n; i++) {
+    int y = 142 + i * 26; bool s = act == i;
+    rr(10, y, 300, 22, 6, s ? C_CARD2 : C_CARD);
+    if (s) { cv.drawRoundRect(10, y, 300, 22, 6, acts[i]->col); cv.drawRoundRect(11, y + 1, 298, 20, 5, acts[i]->col); }
+    txt(acts[i]->label, 22, y + 11, s ? acts[i]->col : C_TEXT, F_BODY);
+    if (s) txt("tieni premuto", 296, y + 11, C_DIM, F_SMALL, textdatum_t::middle_right);
+    if (s && pressStart && !holdFired) { int p = min(1000UL, (millis() - pressStart) * 1000UL / HOLD_MS); rr(10, y + 19, 300 * p / 1000, 3, 1, acts[i]->col); }
+  }
+}
+
+void guestDetail() {
+  Guest* g = guestById(selGuest);
+  if (!g) { view = V_PAGE; return; }
+  header(String(g->id) + " - " + g->name, true);
+  card(10, 38, 300, 64);
+  const char* k[4] = { "tipo", "nodo", "stato", "CPU / RAM" };
+  String v[4] = { g->ct ? "container LXC" : "macchina virtuale", g->node, g->on ? "accesa" : "spenta",
+                  g->on ? String(g->cpu) + "%  -  " + String(g->mem, 2) + " GB" : String("-") };
+  for (int i = 0; i < 4; i++) { int y = 49 + i * 14; txt(k[i], 22, y, C_DIM, F_BODY); txt(v[i], 298, y, i == 2 ? (g->on ? C_OK : C_DIM) : C_TEXT, F_BODY, textdatum_t::middle_right); }
+  const Action* acts[4]; int n = guestActions(g, acts); if (act >= n) act = 0;
+  for (int i = 0; i < n; i++) {
+    int y = 108 + i * 26; bool s = act == i;
+    rr(10, y, 300, 22, 6, s ? C_CARD2 : C_CARD);
+    if (s) { cv.drawRoundRect(10, y, 300, 22, 6, acts[i]->col); cv.drawRoundRect(11, y + 1, 298, 20, 5, acts[i]->col); }
+    txt(acts[i]->label, 22, y + 11, s ? acts[i]->col : C_TEXT, F_BODY);
+    if (s) txt("tieni premuto", 296, y + 11, C_DIM, F_SMALL, textdatum_t::middle_right);
+    if (s && pressStart && !holdFired) { int p = min(1000UL, (millis() - pressStart) * 1000UL / HOLD_MS); rr(10, y + 19, 300 * p / 1000, 3, 1, acts[i]->col); }
+  }
+}
+
+void drawSplash(int pct) {
+  cv.fillScreen(C_BG);
+#if HAS_LOGO
+  cv.pushImage(160 - LOGO_SPLASH_W / 2, 34, LOGO_SPLASH_W, LOGO_SPLASH_H, (const lgfx::rgb565_t*)LOGO_SPLASH);
+#else
+  txt("Proxmox", 160, 90, C_ACC, F_BIG, textdatum_t::middle_center);
+#endif
+  txt("cluster casa", 160, 160, C_DIM, F_BODY, textdatum_t::middle_center);
+  rr(100, 182, 120, 4, 2, C_LINE); rr(100, 182, 120 * pct / 100, 4, 2, C_ACC);
+  txt("in attesa dei dati da pve1...", 160, 200, C_DIM, F_SMALL, textdatum_t::middle_center);
+  cv.pushSprite(0, 0);
+}
+
+void render() {
+  // finche' non arriva il primo dato da pve1 resta la schermata col logo (nessuna pagina vuota)
+  if (!dataOk) { drawSplash((millis() / 25) % 101); return; }
+  cv.fillScreen(C_BG);
+  if (view == V_NODE) nodeDetail();
+  if (view == V_GUEST) guestDetail();
+  if (view == V_PAGE) {
+    header(PAGE_NAMES[page], false);
+    if (nNodes == 0 && page < 4) {
+      txt("Nessun dato dalla USB", 160, 110, C_TEXT, F_TITLE, textdatum_t::middle_center);
+      txt("controlla il cavo verso pve1", 160, 130, C_DIM, F_BODY, textdatum_t::middle_center);
+    } else switch (page) {
       case 0: pageOverview(); break;
       case 1: pageNodes(); break;
       case 2: pageGuests(); break;
       case 3: pageBackupNet(); break;
+      case 4: pageSettings(); break;
     }
   }
   footer();
+  if (toastMsg.length() && millis() < toastUntil) {
+    String m = toastMsg; if (m.length() > 40) m = m.substring(0, 40);
+    int w = tw(m, F_BODY) + 24; rr(160 - w / 2, 196, w, 24, 12, C_ACC); txt(m, 160, 208, C_BG, F_BODY, textdatum_t::middle_center);
+  }
+  if (fresh() && !quorate && view == V_PAGE && (millis() / 500) % 2) { cv.drawRect(0, 0, 320, 240, C_BAD); cv.drawRect(1, 1, 318, 238, C_BAD); }
   cv.pushSprite(0, 0);
-}
-
-void colorTest() {
-  lcd.fillScreen(0x000000u);
-  lcd.fillRect(0, 0, 107, 200, 0xFF0000u);
-  lcd.fillRect(107, 0, 106, 200, 0x00FF00u);
-  lcd.fillRect(213, 0, 107, 200, 0x0000FFu);
-  lcd.setFont(&fonts::FreeSansBold9pt7b); lcd.setTextDatum(textdatum_t::middle_center);
-  lcd.setTextColor(0xFFFFFFu); lcd.drawString("ROSSO", 53, 100); lcd.drawString("BLU", 266, 100);
-  lcd.setTextColor(0x000000u); lcd.drawString("VERDE", 160, 100);
-  lcd.setTextColor(0xFFFFFFu); lcd.setFont(&fonts::Font2);
-  lcd.drawString("sfondo nero = colori giusti", 160, 220);
 }
 
 // =====================================================================
@@ -570,20 +617,23 @@ void barUpdate() {
 }
 
 // =====================================================================
-//  PIR: spegne TFT, OLED e barra dopo SCREEN_OFF_MS senza movimento
+//  PIR: spegne TFT, OLED e barra dopo "Spegni schermi dopo" senza movimento
 // =====================================================================
 bool screensOn = true;
 unsigned long lastMotion = 0;
 
+void applyBrightness() {
+  if (PIN_TFT_BL >= 0) ledcWrite(PIN_TFT_BL, screensOn ? set.brightTft : 0);
+  barBrightness(screensOn ? set.brightBar : 0);
+}
+
 void setScreens(bool on) {
   if (on == screensOn) return;
   screensOn = on;
-  if (PIN_TFT_BL >= 0) ledcWrite(PIN_TFT_BL, on ? BRIGHT_TFT : 0);
   // niente lcd.sleep(): se il LED del TFT e' ancora su 3V3, in sleep il pannello diventa tutto bianco.
-  // Lo riempiamo di nero (con il LED su GPIO 25 si spegne anche la retroilluminazione).
   if (!on) lcd.fillScreen(0x000000u);
   oledsPower(on);
-  barBrightness(on ? BRIGHT_BAR : 0);
+  applyBrightness();
   Serial.println(on ? "SCHERMI_ACCESI" : "SCHERMI_SPENTI");
 }
 
@@ -593,33 +643,133 @@ void pirUpdate() {
 #else
   lastMotion = millis();
 #endif
-  setScreens(millis() - lastMotion < SCREEN_OFF_MS);
+  setScreens(millis() - lastMotion < (unsigned long)set.screenOffSec * 1000UL);
 }
 
 // =====================================================================
-//  Joystick: sinistra/destra = pagina, click = ferma/riprende lo scorrimento
+//  Impostazioni salvate nella memoria dell'ESP (Preferences / NVS)
 // =====================================================================
-void goPage(int p) { page = (p + PAGES) % PAGES; lastPageChange = millis(); }
+void loadSettings() {
+  prefs.begin("plancia", true);
+  set.brightTft = prefs.getInt("tft", 255); set.brightBar = prefs.getInt("bar", 120);
+  // "offs" in secondi; "off" (minuti) e' il vecchio formato, letto solo se il nuovo non c'e'
+  set.screenOffSec = prefs.isKey("offs") ? prefs.getInt("offs", 300) : prefs.getInt("off", 5) * 60;
+  set.autoScroll = prefs.getBool("auto", false);
+  prefs.end();
+  set.brightTft = constrain(set.brightTft, 15, 255); set.brightBar = constrain(set.brightBar, 0, 255);
+  set.screenOffSec = constrain(set.screenOffSec, 5, 1800);
+}
+void saveSettings() {
+  prefs.begin("plancia", false);
+  prefs.putInt("tft", set.brightTft); prefs.putInt("bar", set.brightBar);
+  prefs.putInt("offs", set.screenOffSec); prefs.putBool("auto", set.autoScroll);
+  prefs.end();
+  Serial.println("IMPOSTAZIONI_SALVATE");
+}
+// tempi di spegnimento: 5, 10, 20, 40 s, poi da 1 a 30 minuti
+const int OFF_STEPS[] = { 5, 10, 20, 40, 60, 120, 180, 240, 300, 360, 420, 480, 540, 600, 660, 720, 780, 840, 900,
+                          960, 1020, 1080, 1140, 1200, 1260, 1320, 1380, 1440, 1500, 1560, 1620, 1680, 1740, 1800 };
+const int N_OFF_STEPS = sizeof(OFF_STEPS) / sizeof(OFF_STEPS[0]);
+int stepOff(int cur, int dir) {
+  int i = 0; while (i < N_OFF_STEPS - 1 && OFF_STEPS[i] < cur) i++;   // passo piu' vicino
+  return OFF_STEPS[constrain(i + dir, 0, N_OFF_STEPS - 1)];
+}
+unsigned long settingsDirtyAt = 0;   // salvataggio automatico 2 s dopo l'ultima modifica
+void changeSetting(int i, int dir) {
+  switch (i) {
+    case 0: set.brightTft = constrain(set.brightTft + dir * 15, 15, 255); break;
+    case 1: set.brightBar = constrain(set.brightBar + dir * 15, 0, 255); break;
+    case 2: set.screenOffSec = stepOff(set.screenOffSec, dir); break;
+    case 3: set.autoScroll = !set.autoScroll; break;
+  }
+  applyBrightness();
+  settingsDirtyAt = millis(); if (!settingsDirtyAt) settingsDirtyAt = 1;
+}
+
+// =====================================================================
+//  Joystick: destra/sinistra = pagina, su/giu' = scegli, clic = apri,
+//  tenere premuto = conferma un'azione su un nodo
+// =====================================================================
+int itemCount() { return page == 1 ? min(nNodes, 3) : page == 2 ? nGuests : page == 4 ? 4 : 0; }
+
+void goPage(int p) { page = (p + PAGES) % PAGES; sel = 0; scrollTop = 0; lastPageChange = millis(); }
+
+void joyInput(char k) {        // 'L' 'R' 'U' 'D' 'C'
+  if (!dataOk) return;         // sulla schermata di avvio il joystick non fa niente
+  if (view == V_NODE) {
+    Node* nd = nodeByName(selNode); const Action* acts[3]; int n = nodeActions(nd, acts);
+    if (k == 'L') view = V_PAGE;
+    else if (k == 'U' && n) act = (act + n - 1) % n;
+    else if (k == 'D' && n) act = (act + 1) % n;
+    else if (k == 'C') toast("tieni premuto per confermare");
+    return;
+  }
+  if (view == V_GUEST) {
+    Guest* g = guestById(selGuest); const Action* acts[4]; int n = guestActions(g, acts);
+    if (k == 'L') view = V_PAGE;
+    else if (k == 'U' && n) act = (act + n - 1) % n;
+    else if (k == 'D' && n) act = (act + 1) % n;
+    else if (k == 'C') toast("tieni premuto per confermare");
+    return;
+  }
+  if (page == 4 && editing) {
+    if (k == 'L' || k == 'R') changeSetting(sel, k == 'R' ? 1 : -1);
+    else if (k == 'C') { editing = false; if (settingsDirtyAt) { settingsDirtyAt = 0; saveSettings(); } toast("salvato"); }
+    return;
+  }
+  int n = itemCount();
+  if (k == 'L' || k == 'R') goPage(page + (k == 'R' ? 1 : -1));
+  else if ((k == 'U' || k == 'D') && n) sel = (sel + (k == 'D' ? 1 : n - 1)) % n;
+  else if (k == 'C') {
+    if (page == 1 && sel < nNodes) { view = V_NODE; selNode = nodes[sel].name; act = 0; }
+    else if (page == 2 && sel < nGuests) { view = V_GUEST; selGuest = guests[sel].id; act = 0; }
+    else if (page == 4) editing = true;
+    else toast("niente da aprire qui");
+  }
+}
+
+void holdAction() {
+  if (view == V_GUEST) {
+    Guest* g = guestById(selGuest); const Action* acts[4]; int n = guestActions(g, acts);
+    if (!g || act >= n) return;
+    Serial.printf("GACT %s %d\n", acts[act]->key, g->id);
+    toast(String("inviato: ") + acts[act]->key + " " + String(g->id));
+    return;
+  }
+  if (view != V_NODE) return;
+  Node* nd = nodeByName(selNode); const Action* acts[3]; int n = nodeActions(nd, acts);
+  if (!nd || act >= n) return;
+  Serial.printf("ACT %s %s\n", acts[act]->key, nd->name.c_str());   // cluster-status su pve1 lo esegue
+  toast(String("inviato: ") + acts[act]->key + " " + nd->name);
+}
 
 bool joyUpdate() {
 #if USE_JOY
-  static int dirPrev = 0; static unsigned long tDir = 0;
+  static char dirPrev = 0; static unsigned long tDir = 0;
   static bool swPrev = false; static unsigned long tSw = 0;
   unsigned long now = millis();
   bool changed = false;
-  int x = analogRead(PIN_JOY_X);                      // 0..4095, centro circa 1900
-  int dir = x < 900 ? -1 : (x > 3200 ? 1 : 0);
-  if (JOY_INVERT_X) dir = -dir;
-  if (dir != 0 && (dir != dirPrev || now - tDir > 600)) {   // tenendo premuto avanza ogni 0,6 s
-    if (!screensOn) lastMotion = now;                       // il primo tocco riaccende soltanto
-    else goPage(page + dir);
-    tDir = now; lastButton = now; changed = true;
+  int x = analogRead(PIN_JOY_X), y = analogRead(PIN_JOY_Y);   // 0..4095, centro circa 1900
+  int dx = x < 900 ? -1 : (x > 3200 ? 1 : 0), dy = y < 900 ? -1 : (y > 3200 ? 1 : 0);
+  if (JOY_INVERT_X) dx = -dx;
+  if (JOY_INVERT_Y) dy = -dy;
+  char dir = dx < 0 ? 'L' : dx > 0 ? 'R' : dy < 0 ? 'U' : dy > 0 ? 'D' : 0;
+  if (dir && (dir != dirPrev || now - tDir > (dir == 'U' || dir == 'D' ? 250UL : 600UL))) {   // tenendo premuto ripete
+    if (!screensOn) lastMotion = now;                                     // il primo tocco riaccende soltanto
+    else joyInput(dir);
+    tDir = now; lastButton = now; lastMotion = now; changed = true;
   }
   dirPrev = dir;
   bool sw = digitalRead(PIN_JOY_SW) == LOW;
   if (sw != swPrev && now - tSw > 40) {
-    swPrev = sw; tSw = now;
-    if (sw) { if (screensOn) pageLocked = !pageLocked; lastMotion = now; lastButton = now; changed = true; }
+    swPrev = sw; tSw = now; lastMotion = now; lastButton = now; changed = true;
+    if (!screensOn) { pressStart = 0; }
+    else if (sw) { pressStart = now; holdFired = false; }
+    else if (pressStart) { unsigned long dt = now - pressStart; pressStart = 0; if (!holdFired && dt < 450) joyInput('C'); }
+  }
+  if (sw && pressStart && (view == V_NODE || view == V_GUEST)) {
+    changed = true;                                                       // ridisegna la barra che si riempie
+    if (!holdFired && now - pressStart >= HOLD_MS) { holdFired = true; holdAction(); }
   }
   return changed;
 #else
@@ -633,6 +783,7 @@ bool joyUpdate() {
 void setup() {
   Serial.setRxBufferSize(8192);
   Serial.begin(115200);
+  loadSettings();
 
   // barra: prima di tutto, cosi' all'accensione non mostra LED a caso
   pinMode(PIN_SR_DATA, OUTPUT); pinMode(PIN_SR_CLK, OUTPUT); pinMode(PIN_SR_LATCH, OUTPUT);
@@ -640,12 +791,12 @@ void setup() {
   barBrightness(0);
   barWrite(0);
 
-  if (PIN_TFT_BL >= 0) { ledcAttach(PIN_TFT_BL, 5000, 8); ledcWrite(PIN_TFT_BL, BRIGHT_TFT); }
+  if (PIN_TFT_BL >= 0) { ledcAttach(PIN_TFT_BL, 5000, 8); ledcWrite(PIN_TFT_BL, set.brightTft); }
   lcd.init();
   lcd.setRotation(1);
   cv.setColorDepth(16);
   if (!cv.createSprite(320, 240)) { cv.setColorDepth(8); cv.createSprite(320, 240); Serial.println("SPRITE 8 bit"); }
-  render();
+  drawSplash(10);
 
   oledsInit();
   pinMode(PIN_PIR, INPUT);
@@ -653,10 +804,12 @@ void setup() {
   analogSetPinAttenuation(PIN_JOY_X, ADC_11db);
   analogSetPinAttenuation(PIN_JOY_Y, ADC_11db);
 
-  // prova barra: si riempie e si svuota
-  barBrightness(BRIGHT_BAR);
-  for (int i = 1; i <= 10; i++) { barWrite((1 << i) - 1); delay(40); }
-  for (int i = 9; i >= 0; i--) { barWrite((1 << i) - 1); delay(40); }
+  // prova barra: si riempie e si svuota, intanto la barra della schermata di avvio avanza
+  barBrightness(set.brightBar);
+  for (int i = 1; i <= 10; i++) { barWrite((1 << i) - 1); drawSplash(10 + i * 4); delay(40); }
+  for (int i = 9; i >= 0; i--) { barWrite((1 << i) - 1); drawSplash(50 + (9 - i) * 5); delay(40); }
+  for (int p = 100; p <= 100; p++) drawSplash(p);
+  delay(600);
 
   lastMotion = millis();
   Serial.println("DISPLAY_READY");
@@ -667,9 +820,10 @@ void loop() {
   readSerial();
   pirUpdate();
   bool changed = joyUpdate();
+  if (settingsDirtyAt && now - settingsDirtyAt > 2000) { settingsDirtyAt = 0; saveSettings(); }   // salva anche senza clic
 
-  // scorrimento automatico ogni 12 s (pausa di 60 s dopo il joystick, fermo se bloccato)
-  if (!pageLocked && now - lastButton > 60000 && now - lastPageChange > 12000) goPage(page + 1);
+  // scorrimento automatico (se attivo): ogni 12 s, pausa di 60 s dopo il joystick
+  if (set.autoScroll && view == V_PAGE && !editing && now - lastButton > 60000 && now - lastPageChange > 12000) goPage((page + 1) % 4 == 0 ? 0 : page + 1);
 
   if (screensOn) {
     static unsigned long lastDraw = 0, lastOled = 0, lastBar = 0;
