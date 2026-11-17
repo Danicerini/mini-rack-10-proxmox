@@ -1,0 +1,10 @@
+Sigla,Pezzo
+J1,"Pin femmina 1x15 passo 2,54 (ESP sinistra)"
+J2,"Pin femmina 1x15 passo 2,54 (ESP destra)"
+J3,JST-XH 8 pin verticale (TFT)
+J4,JST-XH 4 pin verticale (OLED pve1)
+J5,JST-XH 4 pin verticale (OLED pve2)
+J6,JST-XH 4 pin verticale (OLED pve3)
+J7,JST-XH 11 pin verticale (barra LED)
+J8,JST-XH 5 pin verticale (joystick)
+J9,JST-XH 3 pin verticale (PIR)

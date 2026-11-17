@@ -1,0 +1,11 @@
+[Unit]
+Description=Stato cluster in JSON per il display ESP32 (sola lettura)
+After=network-online.target pve-cluster.service
+
+[Service]
+ExecStart=/usr/local/bin/cluster-status.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

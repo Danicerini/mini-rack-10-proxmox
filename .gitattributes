@@ -1,0 +1,8 @@
+* text=auto eol=lf
+*.pdf binary
+*.stl binary
+*.3mf binary
+*.png binary
+*.jpg binary
+*.zip binary
+*.kicad_pcb text eol=lf
