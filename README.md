@@ -125,9 +125,10 @@ Segui il manuale [`istruzioni/Manuale_montaggio_rack_10pollici.pdf`](istruzioni/
    - Le opzioni sono in cima al file: `USE_PIR`, `USE_JOY`, `BRIGHT_TFT`, `SCREEN_OFF_MS` e così via.
    - I nomi dei nodi mostrati sugli OLED sono in `OLED_NODE`.
    ```
-   arduino-cli compile --fqbn esp32:esp32:esp32 cluster_completo
-   arduino-cli upload  --fqbn esp32:esp32:esp32 -p COM3 cluster_completo
+   arduino-cli compile --fqbn esp32:esp32:esp32:FlashFreq=40,FlashMode=dio cluster_completo
+   arduino-cli upload  --fqbn esp32:esp32:esp32:FlashFreq=40,FlashMode=dio -p COM3 cluster_completo
    ```
+   > **Flash a 40 MHz**: molti ESP32 economici hanno una flash Puya (ID `0x852016`) che a 80 MHz legge bene ma ignora in silenzio le scritture del firmware, e le impostazioni si perdono a ogni riavvio. A 40 MHz funziona. Il firmware ha i comandi seriali `SET_GET`, `SET_TEST <tft> <barra> <secondi>` e `FLASH_TEST` per controllarlo.
 3. **Server**: l'ESP32 non usa il Wi-Fi. Riceve i dati via USB da un nodo Proxmox.
    - Copia `elettronica/server/cluster-status.py` in `/usr/local/bin/` sul nodo a cui colleghi l'ESP32.
    - Nelle impostazioni in cima al file metti i nomi e gli IP dei tuoi nodi.

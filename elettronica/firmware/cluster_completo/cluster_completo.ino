@@ -23,6 +23,8 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include <Preferences.h>
+#include <esp_partition.h>
+#include <esp_flash.h>
 // Logo Proxmox (media kit ufficiale): file non incluso nella repo pubblica perche' e' un marchio.
 // Se manca, al suo posto viene scritto "Proxmox" in testo.
 #if __has_include("logo_proxmox.h")
@@ -177,6 +179,12 @@ void readSerial() {
       if (rxLine.startsWith("{")) parseStatus(rxLine);
       else if (rxLine.startsWith("ACT_OK")) toast("Fatto: " + rxLine.substring(7));
       else if (rxLine.startsWith("ACT_ERR")) toast("Errore: " + rxLine.substring(8), 4000);
+      else if (rxLine == "SET_GET") printSettings("ATTUALI");
+      else if (rxLine == "FLASH_TEST") flashTest();
+      else if (rxLine.startsWith("SET_TEST ")) {   // prova del salvataggio da pve1: SET_TEST <tft> <bar> <secondi>
+        int a = 0, b = 0, c = 0;
+        if (sscanf(rxLine.c_str() + 9, "%d %d %d", &a, &b, &c) == 3) { set.brightTft = a; set.brightBar = b; set.screenOffSec = c; applyBrightness(); saveSettings(); }
+      }
       rxLine = "";
     } else if (c != '\r' && rxLine.length() < 6000) rxLine += c;
   }
@@ -649,8 +657,27 @@ void pirUpdate() {
 // =====================================================================
 //  Impostazioni salvate nella memoria dell'ESP (Preferences / NVS)
 // =====================================================================
+void flashTest() {   // diagnosi: legge la NVS e prova a scrivere un settore della partizione spiffs (non usata)
+  const esp_partition_t* nv = esp_partition_find_first(ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_NVS, NULL);
+  const esp_partition_t* sp = esp_partition_find_first(ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_SPIFFS, NULL);
+  uint8_t b[16];
+  if (nv) { esp_partition_read(nv, 0, b, 16); Serial.printf("FLASH nvs @0x%x: %02x %02x %02x %02x %02x %02x %02x %02x\n", (unsigned)nv->address, b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]); }
+  if (sp) {
+    esp_err_t e1 = esp_partition_erase_range(sp, 0, 4096);
+    uint8_t w[16]; for (int i = 0; i < 16; i++) w[i] = 0xA0 + i;
+    esp_err_t e2 = esp_partition_write(sp, 0, w, 16);
+    memset(b, 0, 16); esp_err_t e3 = esp_partition_read(sp, 0, b, 16);
+    Serial.printf("FLASH spiffs @0x%x erase=%d write=%d read=%d -> %02x %02x %02x %02x\n", (unsigned)sp->address, e1, e2, e3, b[0], b[1], b[2], b[3]);
+  }
+  uint32_t id = 0; esp_flash_read_id(NULL, &id); Serial.printf("FLASH id=%06x\n", (unsigned)id);
+}
+void printSettings(const char* tag) {
+  Serial.printf("IMPOSTAZIONI %s tft=%d bar=%d offs=%d auto=%d\n", tag, set.brightTft, set.brightBar, set.screenOffSec, set.autoScroll);
+}
 void loadSettings() {
-  prefs.begin("plancia", true);
+  // in scrittura (false) cosi' lo spazio "plancia" viene creato se non c'e' ancora: in sola lettura fallirebbe
+  bool ok = prefs.begin("plancia", false);
+  Serial.printf("NVS apertura %s\n", ok ? "ok" : "FALLITA");
   set.brightTft = prefs.getInt("tft", 255); set.brightBar = prefs.getInt("bar", 120);
   // "offs" in secondi; "off" (minuti) e' il vecchio formato, letto solo se il nuovo non c'e'
   set.screenOffSec = prefs.isKey("offs") ? prefs.getInt("offs", 300) : prefs.getInt("off", 5) * 60;
@@ -658,13 +685,16 @@ void loadSettings() {
   prefs.end();
   set.brightTft = constrain(set.brightTft, 15, 255); set.brightBar = constrain(set.brightBar, 0, 255);
   set.screenOffSec = constrain(set.screenOffSec, 5, 1800);
+  printSettings("CARICATE");
 }
 void saveSettings() {
-  prefs.begin("plancia", false);
-  prefs.putInt("tft", set.brightTft); prefs.putInt("bar", set.brightBar);
-  prefs.putInt("offs", set.screenOffSec); prefs.putBool("auto", set.autoScroll);
+  bool ok = prefs.begin("plancia", false);
+  size_t n = 0;
+  n += prefs.putInt("tft", set.brightTft); n += prefs.putInt("bar", set.brightBar);
+  n += prefs.putInt("offs", set.screenOffSec); n += prefs.putBool("auto", set.autoScroll);
   prefs.end();
-  Serial.println("IMPOSTAZIONI_SALVATE");
+  Serial.printf("IMPOSTAZIONI_SALVATE apertura=%s byte=%u\n", ok ? "ok" : "FALLITA", (unsigned)n);
+  printSettings("SALVATE");
 }
 // tempi di spegnimento: 5, 10, 20, 40 s, poi da 1 a 30 minuti
 const int OFF_STEPS[] = { 5, 10, 20, 40, 60, 120, 180, 240, 300, 360, 420, 480, 540, 600, 660, 720, 780, 840, 900,
